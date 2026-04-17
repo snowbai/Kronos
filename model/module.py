@@ -7,12 +7,22 @@ from torch.autograd import Function
 import torch.nn.functional as F
 
 
+def _mps_safe_scatter_reduce(output, dim, index, src, reduce="sum"):
+    """scatter_reduce with MPS fallback — the op is unsupported on Apple Metal."""
+    if output.device.type == "mps":
+        output_cpu = output.cpu()
+        output_cpu.scatter_reduce_(dim, index.cpu(), src.cpu(), reduce=reduce)
+        return output_cpu.to(output.device)
+    output.scatter_reduce_(dim, index, src, reduce=reduce)
+    return output
+
+
 class DifferentiableEntropyFunction(Function):
     @staticmethod
     def forward(ctx, zq, basis, K, eps):
         zb = (zq + 1) / 2
         zi = ((zb * basis).sum(-1)).to(torch.int64)
-        cnt = torch.scatter_reduce(torch.zeros(2 ** K, device=zq.device, dtype=zq.dtype),
+        cnt = _mps_safe_scatter_reduce(torch.zeros(2 ** K, device=zq.device, dtype=zq.dtype),
                                    0,
                                    zi.flatten(),
                                    torch.ones_like(zi.flatten()).to(zq.dtype),
@@ -342,7 +352,7 @@ class MultiHeadAttentionWithRoPE(nn.Module):
         else:
             attn_mask = None
 
-        attn_output = F.scaled_dot_product_attention(
+        attn_output = _mps_safe_sdpa(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
@@ -351,6 +361,25 @@ class MultiHeadAttentionWithRoPE(nn.Module):
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         return self.resid_dropout(self.out_proj(attn_output))
+
+
+def _mps_safe_sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False):
+    """SDPA with MPS fallback — uses MATH backend to avoid broken Flash/MemEff paths on Metal."""
+    if q.device.type == "mps":
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel([SDPBackend.MATH]):
+            return F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+                is_causal=is_causal,
+            )
+    return F.scaled_dot_product_attention(
+        q, k, v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=is_causal,
+    )
 
 
 class MultiHeadCrossAttentionWithRoPE(nn.Module):
@@ -386,7 +415,7 @@ class MultiHeadCrossAttentionWithRoPE(nn.Module):
 
         is_causal_flag = self.training
 
-        attn_output = F.scaled_dot_product_attention(
+        attn_output = _mps_safe_sdpa(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout_p if self.training else 0.0,
